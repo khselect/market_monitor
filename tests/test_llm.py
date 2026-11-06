@@ -61,6 +61,8 @@ def test_briefing_roundtrip_with_sdk(monkeypatch):
     client = anthropic.Anthropic(api_key="test", base_url=f"http://127.0.0.1:{srv.server_port}", max_retries=0)
     facts = {"asof": "2026-11-05", "panels": {}, "scenarios": [{"id": "base", "label": "x", "prob_next_month": 0.7}]}
     monkeypatch.setattr(briefing, "build_facts", lambda: facts)
+    monkeypatch.setattr(briefing, "yahoo_news", lambda kind: [])
+    monkeypatch.setattr(briefing, "alphavantage_news", lambda: [])
     out = briefing.generate(weekly=False, client=client)
     srv.shutdown()
 
@@ -76,3 +78,36 @@ def test_briefing_roundtrip_with_sdk(monkeypatch):
     synth = [c for c in CALLS if "format" in c["body"].get("output_config", {})][0]["body"]
     assert synth["output_config"]["format"]["schema"]["additionalProperties"] is False
     assert "FACTS" in synth["messages"][0]["content"]
+
+
+def test_parse_yf_news_both_formats():
+    old = [{"title": "A", "link": "https://x/a", "publisher": "Reuters", "providerPublishTime": 1762400000}]
+    new = [{"id": "1", "content": {"title": "B", "summary": "s", "pubDate": "2026-11-06T10:00:00Z",
+                                   "canonicalUrl": {"url": "https://x/b"}, "provider": {"displayName": "Yahoo"}}},
+           {"id": "2", "content": {"title": "no url"}}]
+    out = briefing.parse_yf_news(old) + briefing.parse_yf_news(new)
+    assert [o["url"] for o in out] == ["https://x/a", "https://x/b"] and out[1]["source"] == "Yahoo"
+
+
+def test_template_uses_feeds_and_records_reason(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    facts = {"asof": "2026-11-05", "panels": {}, "scenarios": []}
+    monkeypatch.setattr(briefing, "build_facts", lambda: facts)
+    feed = [{"title": "Fed holds", "url": "https://x/f", "source": "Reuters", "time": "2026-11-06", "summary": ""}]
+    monkeypatch.setattr(briefing, "yahoo_news", lambda kind: feed)
+    monkeypatch.setattr(briefing, "alphavantage_news", lambda: [])
+    out = briefing.generate()
+    assert out["_meta"]["generator"] == "template" and "ANTHROPIC_API_KEY" in out["_meta"]["diag"]["reason"]
+    assert out["stock_news"][0]["url"] == "https://x/f" and out["ai_trends"][0]["title"] == "Fed holds"
+
+
+def test_web_search_error_object_is_recorded():
+    """웹 검색 비활성 등 서버 도구 오류는 HTTP 200 + 오류 객체 → 진단에 기록돼야 함(이전엔 무시됨)."""
+    from types import SimpleNamespace as N
+    resp = N(stop_reason="end_turn", content=[
+        N(type="web_search_tool_result", content=N(type="web_search_tool_result_error", error_code="unavailable")),
+        N(type="text", text="검색 불가")])
+    client = N(beta=N(messages=N(create=lambda **kw: resp)))
+    diag = {}
+    r = briefing._research(client, "market", 1, 1, diag)
+    assert r["sources"] == [] and diag["research"][0]["errors"] == ["unavailable"]

@@ -9,6 +9,24 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(os.environ.get("MM_HOME", Path(__file__).resolve().parents[2]))
+
+
+def _load_dotenv(path: Path) -> None:
+    """프로젝트 루트 .env 를 환경변수로 로드(이미 설정된 값은 덮지 않음).
+    → `python -m jobs.run …` / `streamlit run …` 을 셸에서 직접 실행해도 키가 적용됨."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip().removeprefix("export ").strip(), v.strip().strip('"').strip("'")
+        if k and v and k not in os.environ:
+            os.environ[k] = v
+
+
+_load_dotenv(ROOT / ".env")
 CONFIG_DIR = ROOT / "config"
 DATA_DIR = Path(os.environ.get("MM_DATA", ROOT / "data"))
 PRICES_DIR = DATA_DIR / "prices"

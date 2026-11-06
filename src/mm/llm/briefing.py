@@ -149,7 +149,19 @@ def _client():
     return anthropic.Anthropic(max_retries=3, timeout=600)
 
 
-def _research(client, topic: str, days: int, max_uses: int) -> dict:
+def _create(client, diag: dict, **kw):
+    """fallbacks 베타가 계정/모델에서 거부되면(400) fallbacks 없이 1회 재시도하고 진단에 기록."""
+    import anthropic
+    try:
+        return client.beta.messages.create(betas=[FALLBACK_BETA], fallbacks="default", **kw)
+    except anthropic.BadRequestError as e:
+        if "fallback" not in str(e).lower():
+            raise
+        diag.setdefault("notes", []).append("fallbacks 미지원 → 미사용으로 재시도")
+        return client.beta.messages.create(**kw)
+
+
+def _research(client, topic: str, days: int, max_uses: int, diag: dict) -> dict:
     prompts = {
         "market": (f"최근 {days}일 동안의 미국 증시(나스닥·다우·S&P500)와 한국 증시(코스피) 주요 뉴스, 연준·금리·환율·원자재 관련 이슈, "
                    "그리고 앞으로 1주일 내 시장에 영향을 줄 일정을 조사해서 핵심만 메모해줘. 항목마다 출처 URL을 붙여줘."),
@@ -157,54 +169,116 @@ def _research(client, topic: str, days: int, max_uses: int) -> dict:
                "시장·산업 영향 관점으로 핵심만 메모해줘. 항목마다 출처 URL을 붙여줘."),
     }
     messages = [{"role": "user", "content": prompts[topic]}]
-    sources, text = [], []
+    sources, text, errors, n_search = [], [], [], 0
+    stop = None
     for _ in range(5):                                     # pause_turn 재개 최대 5회
-        resp = client.beta.messages.create(
-            model=MODEL, max_tokens=16000, betas=[FALLBACK_BETA], fallbacks="default",
-            thinking={"type": "adaptive"}, output_config={"effort": "medium"},
-            tools=[{**WEB_SEARCH, "max_uses": max_uses}], messages=messages)
-        if resp.stop_reason == "refusal":
-            log.warning("research %s refused: %s", topic, getattr(resp, "stop_details", None))
+        resp = _create(client, diag, model=MODEL, max_tokens=16000, thinking={"type": "adaptive"},
+                       output_config={"effort": "medium"}, tools=[{**WEB_SEARCH, "max_uses": max_uses}],
+                       messages=messages)
+        stop = resp.stop_reason
+        if stop == "refusal":
+            errors.append(f"refusal:{getattr(getattr(resp, 'stop_details', None), 'category', None)}")
             break
         for b in resp.content:
             if b.type == "text":
                 text.append(b.text)
-            elif b.type == "web_search_tool_result" and isinstance(b.content, list):
-                sources += [{"title": getattr(x, "title", ""), "url": getattr(x, "url", "")} for x in b.content]
-        if resp.stop_reason != "pause_turn":
+            elif b.type == "web_search_tool_result":
+                n_search += 1
+                if isinstance(b.content, list):
+                    sources += [{"title": getattr(x, "title", ""), "url": getattr(x, "url", "")} for x in b.content]
+                else:   # 서버 도구 오류는 예외가 아니라 오류 객체로 옴 (예: 조직 설정에서 웹 검색 비활성)
+                    errors.append(str(getattr(b.content, "error_code", b.content)))
+        if stop != "pause_turn":
             break
         messages.append({"role": "assistant", "content": resp.content})
     seen, uniq = set(), []
-    for s in sources:
-        if s["url"] and s["url"] not in seen:
-            seen.add(s["url"])
-            uniq.append(s)
+    for s_ in sources:
+        if s_["url"] and s_["url"] not in seen:
+            seen.add(s_["url"])
+            uniq.append(s_)
+    diag.setdefault("research", []).append({"topic": topic, "searches": n_search, "sources": len(uniq),
+                                            "errors": sorted(set(errors)), "stop_reason": stop,
+                                            "notes_chars": sum(map(len, text))})
     return {"topic": topic, "notes": "\n".join(text).strip(), "sources": uniq[:40]}
 
 
-def _synthesize(client, facts: dict, research: list[dict], extra_news: list[dict], weekly: bool) -> dict:
+def _synthesize(client, facts: dict, research: list[dict], feeds: dict, weekly: bool, diag: dict) -> dict:
     n_news = "6~8" if weekly else "3~5"
     user = (f"FACTS:\n{json.dumps(facts, ensure_ascii=False)}\n\n"
             + "".join(f"RESEARCH[{r['topic']}]:\n{r['notes']}\nSOURCES:{json.dumps(r['sources'], ensure_ascii=False)}\n\n"
                       for r in research)
-            + (f"NEWS_SENTIMENT(Alpha Vantage):\n{json.dumps(extra_news, ensure_ascii=False)}\n\n" if extra_news else "")
+            + "".join(f"NEWS_FEED[{k}] (제목·URL 확인된 헤드라인 — 출처로 사용 가능):\n{json.dumps(v, ensure_ascii=False)}\n\n"
+                      for k, v in feeds.items() if v)
             + f"{'주간 다이제스트(지난 1주 회고 + 다음 주 관전 포인트)' if weekly else '일일 브리핑'}을 작성해줘. "
-            f"stock_news·ai_trends는 각 {n_news}개, market_brief 3~5개, korea_brief 1~3개, "
+            f"stock_news·ai_trends는 각 {n_news}개(RESEARCH 또는 NEWS_FEED의 URL만 사용), market_brief 3~5개, korea_brief 1~3개, "
             "scenarios는 FACTS.scenarios의 id(up/base/down) 각각 1개, event_watch는 upcoming_events 중 중요한 것 최대 5개, risks 2~4개.")
-    resp = client.beta.messages.create(
-        model=MODEL, max_tokens=16000, betas=[FALLBACK_BETA], fallbacks="default",
-        thinking={"type": "adaptive"}, output_config={"effort": "medium", "format": {"type": "json_schema", "schema": SCHEMA}},
-        system=SYSTEM, messages=[{"role": "user", "content": user}])
+    resp = _create(client, diag, model=MODEL, max_tokens=16000, thinking={"type": "adaptive"},
+                   output_config={"effort": "medium", "format": {"type": "json_schema", "schema": SCHEMA}},
+                   system=SYSTEM, messages=[{"role": "user", "content": user}])
     if resp.stop_reason == "refusal":
         raise RuntimeError(f"synthesis refused: {getattr(resp, 'stop_details', None)}")
+    if resp.stop_reason == "max_tokens":
+        raise RuntimeError("synthesis truncated (max_tokens)")
     txt = next(b.text for b in resp.content if b.type == "text")
     out = json.loads(txt)
     out["_usage"] = {"input": resp.usage.input_tokens, "output": resp.usage.output_tokens, "model": resp.model}
     return out
 
 
+# ── 키 없이 쓰는 뉴스 피드 (yfinance) — LLM 입력 보강 + 템플릿 모드에서도 뉴스 패널 표시 ─────────
+NEWS_TICKERS = {"stock": ["^GSPC", "^IXIC", "^KS11", "SPY"], "ai": ["NVDA", "MSFT", "GOOGL", "META", "AMD"]}
+
+
+def parse_yf_news(items: list) -> list[dict]:
+    """yfinance 뉴스 두 형식 지원: 구형 {title, link, publisher, providerPublishTime} /
+    신형 {id, content:{title, summary, pubDate, canonicalUrl:{url}, provider:{displayName}}}"""
+    out = []
+    for it in items or []:
+        c = it.get("content", it) if isinstance(it, dict) else {}
+        title = c.get("title")
+        url = (c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url") or c.get("link")
+        if not title or not url:
+            continue
+        pub = (c.get("provider") or {}).get("displayName") or c.get("publisher") or ""
+        when = c.get("pubDate") or c.get("displayTime") or (
+            datetime.fromtimestamp(c["providerPublishTime"], timezone.utc).isoformat() if c.get("providerPublishTime") else "")
+        out.append({"title": title, "url": url, "source": pub, "time": str(when)[:16],
+                    "summary": (c.get("summary") or "")[:300]})
+    return out
+
+
+def yahoo_news(kind: str, per_ticker: int = 6, limit: int = 15) -> list[dict]:
+    if offline_mode():
+        return []
+    import yfinance as yf
+    seen, out = set(), []
+    for t in NEWS_TICKERS[kind]:
+        try:
+            items = parse_yf_news(yf.Ticker(t).news)[:per_ticker]
+        except Exception as e:  # noqa: BLE001
+            log.warning("yahoo news %s: %r", t, e)
+            continue
+        for n in items:
+            if n["url"] not in seen:
+                seen.add(n["url"])
+                out.append(n)
+    out.sort(key=lambda x: x["time"], reverse=True)
+    return out[:limit]
+
+
+def _feed_items(feed: list[dict], n: int, ai: bool = False) -> list[dict]:
+    items = []
+    for x in feed[:n]:
+        d = {"title": x["title"], "summary": x.get("summary") or f'{x.get("source", "")} · {x.get("time", "")}', "url": x["url"]}
+        if ai:
+            d["impact"] = ""
+        items.append(d)
+    return items
+
+
 # ── 템플릿 폴백 (키 없음/오프라인/LLM 실패) ─────────────────────────────────────────
-def template_briefing(facts: dict, weekly: bool = False) -> dict:
+def template_briefing(facts: dict, weekly: bool = False, feeds: dict | None = None) -> dict:
+    feeds = feeds or {}
     ind = {x["name"]: x for x in facts["panels"].get("indicators", [])}
     def mv(n):
         x = ind.get(n)
@@ -224,7 +298,8 @@ def template_briefing(facts: dict, weekly: bool = False) -> dict:
         "scenarios": [{"id": k, "narrative": f"{sc[k]['label']} — 다음 달 확률 {sc[k]['prob_next_month'] * 100:.0f}% (국면 전이행렬)",
                        "triggers": [], "portfolio_note": ""} for k in ("base", "up", "down") if k in sc],
         "event_watch": [{"date": e["date"], "event": e["event"], "why": ""} for e in facts.get("upcoming_events", [])[:5]],
-        "stock_news": [], "ai_trends": [],
+        "stock_news": _feed_items(feeds.get("stock", []), 8 if weekly else 5),
+        "ai_trends": _feed_items(feeds.get("ai", []), 8 if weekly else 5, ai=True),
         "risks": [f"{g['label']}: {g['verdict']}" for g in (facts.get("portfolio_goals") or {}).get("verdict", [])
                   if g["verdict"] != "충족"],
     }
@@ -247,34 +322,72 @@ def alphavantage_news(limit: int = 30) -> list[dict]:
 
 def generate(weekly: bool = False, client=None) -> dict:
     facts = build_facts()
+    key = bool(os.environ.get("ANTHROPIC_API_KEY"))
     meta = {"generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "weekly": weekly,
-            "asof": facts["asof"], "model": None, "generator": "template", "sources": []}
-    use_llm = client is not None or (os.environ.get("ANTHROPIC_API_KEY") and not offline_mode())
+            "asof": facts["asof"], "model": None, "generator": "template", "sources": [],
+            "diag": {"api_key_present": key, "offline": offline_mode()}}
+    diag = meta["diag"]
+    feeds = {}
+    for k, fn in (("stock", lambda: yahoo_news("stock")), ("ai", lambda: yahoo_news("ai")), ("alphavantage", alphavantage_news)):
+        try:
+            feeds[k] = fn()
+        except Exception as e:  # noqa: BLE001
+            log.warning("news feed %s: %r", k, e)
+            feeds[k] = []
+    diag["feeds"] = {k: len(v) for k, v in feeds.items()}
+
+    use_llm = client is not None or (key and not offline_mode())
+    if not use_llm:
+        diag["reason"] = "오프라인 모드(MM_OFFLINE=1)" if offline_mode() else "ANTHROPIC_API_KEY 없음(.env 확인)"
     body = None
     if use_llm:
         try:
             client = client or _client()
             days = 7 if weekly else 2
-            research = [_research(client, "market", days, 8 if weekly else 5),
-                        _research(client, "ai", days, 6 if weekly else 4)]
-            try:
-                news = alphavantage_news()
-            except Exception as e:  # noqa: BLE001
-                log.warning("alphavantage news: %r", e)
-                news = []
-            body = _synthesize(client, facts, research, news, weekly)
+            research = [_research(client, "market", days, 8 if weekly else 5, diag),
+                        _research(client, "ai", days, 6 if weekly else 4, diag)]
+            body = _synthesize(client, facts, research, feeds, weekly, diag)
             meta.update(generator="claude", model=body.pop("_usage", {}).get("model", MODEL),
-                        sources=[s for r in research for s in r["sources"]])
+                        sources=[s_ for r in research for s_ in r["sources"]])
+            # LLM이 근거 부족으로 뉴스를 비웠으면 확인된 피드 헤드라인으로 보충(요약은 생성하지 않음)
+            if not body.get("stock_news") and feeds.get("stock"):
+                body["stock_news"] = _feed_items(feeds["stock"], 5)
+                diag.setdefault("notes", []).append("stock_news ← Yahoo 피드 보충")
+            if not body.get("ai_trends") and feeds.get("ai"):
+                body["ai_trends"] = _feed_items(feeds["ai"], 5, ai=True)
+                diag.setdefault("notes", []).append("ai_trends ← Yahoo 피드 보충")
         except Exception as e:  # noqa: BLE001 — 브리핑 실패가 일일 파이프라인을 멈추면 안 됨
             log.exception("LLM briefing failed → template")
-            meta["error"] = repr(e)[:300]
+            meta["error"] = f"{type(e).__name__}: {str(e)[:280]}"
+            diag["reason"] = "LLM 호출 실패"
     if body is None:
-        body = template_briefing(facts, weekly)
+        body = template_briefing(facts, weekly, feeds)
     out = {**body, "_meta": meta, "_scenarios": facts.get("scenarios", [])}
     name = f"{'weekly' if weekly else 'daily'}-{facts['asof']}.json"
     for p in (BRIEF_DIR / name, BRIEF_DIR / ("latest_weekly.json" if weekly else "latest.json")):
         p.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
     return out
+
+
+def diagnose(lines: list[str] | None = None) -> str:
+    """브리핑 상태를 사람이 읽을 수 있는 한 줄 요약으로."""
+    b = load_latest()
+    if not b:
+        return "브리핑 파일 없음 — python -m jobs.run briefing"
+    m = b["_meta"]
+    if "diag" not in m:
+        return "이전 버전 브리핑(진단 정보 없음) — python -m jobs.run briefing 으로 재생성"
+    d = m.get("diag", {})
+    parts = [f"생성={m.get('generator')}", f"키={'있음' if d.get('api_key_present') else '없음'}"]
+    if d.get("reason"):
+        parts.append(f"사유={d['reason']}")
+    if m.get("error"):
+        parts.append(f"오류={m['error']}")
+    for r in d.get("research", []):
+        parts.append(f"검색[{r['topic']}] {r['searches']}회·출처 {r['sources']}개" + (f"·오류 {r['errors']}" if r["errors"] else ""))
+    if d.get("feeds"):
+        parts.append("피드 " + ", ".join(f"{k}:{v}" for k, v in d["feeds"].items()))
+    return " · ".join(parts)
 
 
 def load_latest(weekly: bool = False) -> dict | None:
