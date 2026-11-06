@@ -1,0 +1,66 @@
+# 경제 이벤트 캘린더 — 하이브리드 구성
+#
+#  ① manual  : 이 파일에서 직접 관리 (연 8회 수준, 연초 1회 갱신이면 충분)
+#              FOMC, 한국은행 금통위, 옵션만기, 휴장일 등
+#  ② fred    : FRED API release 일정 자동 수집 (CPI/고용/GDP/PCE …, 미래 일정 포함)
+#              → FRED_API_KEY 필요(무료). release_id → 이벤트 타입 매핑은 아래 fred_releases
+#  ③ earnings: yfinance 실적발표일 (빅테크/반도체 대형주만)
+#
+# status: confirmed(공식 확인) | tentative(잠정/2차출처) — tentative 는 화면에 '?' 표시
+# tier:   1 = 지수 변동성에 큰 영향, 2 = 중간, 3 = 참고
+# 출처 확인: FOMC  https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+#           금통위 https://www.bok.or.kr (통화정책 > 통화정책방향 결정회의 > 일정)
+
+event_types:
+  FOMC:    {name: "FOMC 금리결정",   tier: 1, region: US, time_local: "14:00 ET"}
+  BOK:     {name: "한은 금통위",      tier: 1, region: KR, time_local: "10:00 KST"}
+  CPI:     {name: "미 CPI",          tier: 1, region: US, time_local: "08:30 ET"}
+  NFP:     {name: "미 고용보고서",     tier: 1, region: US, time_local: "08:30 ET"}
+  GDP:     {name: "미 GDP",          tier: 2, region: US, time_local: "08:30 ET"}
+  PCE:     {name: "미 PCE·개인소득",   tier: 2, region: US, time_local: "08:30 ET"}
+  PPI:     {name: "미 PPI",          tier: 2, region: US, time_local: "08:30 ET"}
+  RETAIL:  {name: "미 소매판매",       tier: 2, region: US, time_local: "08:30 ET"}
+  OPEX:    {name: "옵션 만기",         tier: 3, region: US}
+  EARN:    {name: "대형주 실적",       tier: 2, region: US}
+
+# ② FRED release_id 매핑 — 첫 실행 시 fred/release?release_id= 로 이름 검증 후 사용
+fred_releases:
+  CPI:    10    # Consumer Price Index
+  NFP:    50    # Employment Situation
+  GDP:    53    # Gross Domestic Product
+  PCE:    54    # Personal Income and Outlays
+  PPI:    46    # Producer Price Index      (검증 필요)
+  RETAIL: 9     # Advance Retail Sales      (검증 필요)
+
+# ③ 실적발표 추적 대상
+earnings_watch: [AAPL, MSFT, NVDA, GOOGL, AMZN, META, TSLA, AVGO, "005930.KS", "000660.KS"]
+
+# ① 수동 관리 일정 (결정 발표일 기준)
+manual:
+  # FOMC 2026 — 2일 회의의 2일차(성명 발표일). sep: 경제전망(점도표) 동반
+  - {date: 2026-01-28, type: FOMC, status: confirmed}
+  - {date: 2026-03-18, type: FOMC, status: confirmed, sep: true}
+  - {date: 2026-04-29, type: FOMC, status: confirmed}
+  - {date: 2026-06-17, type: FOMC, status: confirmed, sep: true}
+  - {date: 2026-07-29, type: FOMC, status: confirmed}
+  - {date: 2026-09-16, type: FOMC, status: confirmed, sep: true}
+  - {date: 2026-10-28, type: FOMC, status: confirmed}
+  - {date: 2026-12-09, type: FOMC, status: confirmed, sep: true}
+  # FOMC 2027 — 2025-09-05 연준 잠정 일정 발표(2차출처 기준). 9·10월분은 공식 페이지에서 채울 것
+  - {date: 2027-01-27, type: FOMC, status: tentative}
+  - {date: 2027-03-17, type: FOMC, status: tentative, sep: true}
+  - {date: 2027-04-28, type: FOMC, status: tentative}
+  - {date: 2027-06-09, type: FOMC, status: tentative, sep: true}
+  - {date: 2027-07-28, type: FOMC, status: tentative}
+  - {date: 2027-12-08, type: FOMC, status: tentative, sep: true}
+
+  # 한은 금통위 2026 (통화정책방향 결정회의). 4월분 미확인 → 공식 페이지에서 채울 것
+  - {date: 2026-01-15, type: BOK, status: confirmed}
+  - {date: 2026-02-26, type: BOK, status: confirmed}
+  - {date: 2026-05-28, type: BOK, status: tentative}
+  - {date: 2026-07-16, type: BOK, status: tentative}
+  - {date: 2026-08-27, type: BOK, status: tentative}
+  - {date: 2026-10-22, type: BOK, status: tentative}
+  - {date: 2026-11-26, type: BOK, status: tentative}
+
+# 옵션만기(매월 셋째 금요일)는 코드에서 자동 생성 → 여기 적지 않음

@@ -1,0 +1,32 @@
+# Mac mini 운영: dashboard(읽기 전용) + worker(수집·예측 스케줄러), 데이터는 ./data 공유
+services:
+  worker:
+    build: .
+    container_name: market_monitor_worker
+    restart: unless-stopped
+    command: ["python", "-m", "jobs.scheduler", "--now"]
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./config:/app/config:ro      # YAML 수정 → 재빌드 없이 다음 실행에 반영
+    networks: [mm_net]
+
+  dashboard:
+    build: .
+    container_name: market_monitor_app
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data:ro
+      - ./config:/app/config:ro
+    ports:
+      - "${MM_PORT:-8502}:8501"       # 로컬 확인용 (터널은 sielain_net 내부 DNS 사용)
+    depends_on: [worker]
+    networks: [mm_net, sielain_net]
+
+networks:
+  mm_net:
+    driver: bridge
+  sielain_net:
+    external: true
+    name: docker_sielain_net          # 기존 cloudflared(sielain_tunnel) 공유 네트워크

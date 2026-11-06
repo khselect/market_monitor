@@ -1,0 +1,73 @@
+# 대시보드 패널별 수집 대상 (화면 구성 = 이 파일 구성)
+# source: yahoo | fred
+# kind:   price(가격) | yield(금리, % 단위 → 변화량 bp로 표시)
+history_start: "2000-01-01"
+
+panels:
+  indicators:            # [주요지표]
+    title: 주요지표
+    items:
+      - {id: SPX,    name: "S&P 500",   source: yahoo, symbol: "^GSPC",    kind: price}
+      - {id: NDX,    name: "나스닥100",  source: yahoo, symbol: "^NDX",     kind: price}
+      - {id: DJI,    name: "다우",       source: yahoo, symbol: "^DJI",     kind: price}
+      - {id: KOSPI,  name: "코스피",     source: yahoo, symbol: "^KS11",    kind: price}
+      - {id: KOSDAQ, name: "코스닥",     source: yahoo, symbol: "^KQ11",    kind: price}
+      - {id: VIX,    name: "VIX",        source: yahoo, symbol: "^VIX",     kind: price}
+      - {id: DXY,    name: "달러인덱스", source: yahoo, symbol: "DX-Y.NYB", kind: price}
+      - {id: USDKRW, name: "원/달러",    source: yahoo, symbol: "KRW=X",    kind: price}
+
+  commodities:           # [원자재]
+    title: 원자재
+    items:
+      - {id: WTI,    name: "WTI",   source: yahoo, symbol: "CL=F", kind: price}
+      - {id: BRENT,  name: "브렌트", source: yahoo, symbol: "BZ=F", kind: price}
+      - {id: GOLD,   name: "금",    source: yahoo, symbol: "GC=F", kind: price}
+      - {id: SILVER, name: "은",    source: yahoo, symbol: "SI=F", kind: price}
+      - {id: COPPER, name: "구리",  source: yahoo, symbol: "HG=F", kind: price}
+      - {id: NATGAS, name: "천연가스", source: yahoo, symbol: "NG=F", kind: price}
+
+  treasuries:            # [국채 1,5,10,30년물] — Yahoo에 1Y가 없어 FRED로 통일(일관성)
+    title: 미 국채 금리
+    items:
+      - {id: UST1Y,  name: "1년",  source: fred, symbol: "DGS1",  kind: yield, maturity: 1}
+      - {id: UST2Y,  name: "2년",  source: fred, symbol: "DGS2",  kind: yield, maturity: 2}
+      - {id: UST5Y,  name: "5년",  source: fred, symbol: "DGS5",  kind: yield, maturity: 5}
+      - {id: UST10Y, name: "10년", source: fred, symbol: "DGS10", kind: yield, maturity: 10}
+      - {id: UST30Y, name: "30년", source: fred, symbol: "DGS30", kind: yield, maturity: 30}
+
+  sectors:               # [산업별] — SPDR 섹터 ETF
+    title: 산업별
+    items:
+      - {id: XLK,  name: "기술",       source: yahoo, symbol: XLK,  kind: price}
+      - {id: XLC,  name: "커뮤니케이션", source: yahoo, symbol: XLC,  kind: price}
+      - {id: XLY,  name: "임의소비재",  source: yahoo, symbol: XLY,  kind: price}
+      - {id: XLF,  name: "금융",       source: yahoo, symbol: XLF,  kind: price}
+      - {id: XLV,  name: "헬스케어",    source: yahoo, symbol: XLV,  kind: price}
+      - {id: XLI,  name: "산업재",     source: yahoo, symbol: XLI,  kind: price}
+      - {id: XLE,  name: "에너지",     source: yahoo, symbol: XLE,  kind: price}
+      - {id: XLB,  name: "소재",       source: yahoo, symbol: XLB,  kind: price}
+      - {id: XLP,  name: "필수소비재",  source: yahoo, symbol: XLP,  kind: price}
+      - {id: XLU,  name: "유틸리티",    source: yahoo, symbol: XLU,  kind: price}
+      - {id: XLRE, name: "부동산",     source: yahoo, symbol: XLRE, kind: price}
+
+  assets:                # 포트폴리오 시뮬레이션용 자산 (화면 비표시)
+    title: 포트폴리오 자산
+    hidden: true
+    items:
+      - {id: SPY, name: "미국주식", source: yahoo, symbol: SPY, kind: price}
+      - {id: EWY, name: "한국주식", source: yahoo, symbol: EWY, kind: price}
+      - {id: IEF, name: "미국채 7-10Y", source: yahoo, symbol: IEF, kind: price}
+      - {id: TLT, name: "미국채 20Y+",  source: yahoo, symbol: TLT, kind: price}
+      - {id: GLD, name: "금 ETF",     source: yahoo, symbol: GLD, kind: price}
+
+# [예상] 패널: 일간 예측 대상 (마감 기준 등락률)
+forecast_targets: [SPX, NDX, KOSPI]
+
+# 10년 시뮬레이션 기본 포트폴리오 (화면 사이드바에서 조정 가능)
+default_portfolio:
+  weights: {SPY: 0.45, EWY: 0.15, IEF: 0.25, TLT: 0.05, GLD: 0.10}
+  initial: 100000000        # 1억 원
+  monthly_contribution: 1000000
+  years: 10
+  rebalance: quarterly
+  inflation: 0.025
