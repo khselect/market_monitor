@@ -1,6 +1,8 @@
-data/
-!data/.gitkeep
+# 루트 data/ (수집 캐시·예측·브리핑)만 무시 — src/mm/data/ 코드 패키지는 추적
+/data/*
+!/data/.gitkeep
 .env
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
