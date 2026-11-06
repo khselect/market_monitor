@@ -18,12 +18,15 @@ from mm.data import store
 from mm.data.update import update_all
 from mm.eval import calibration as cal
 from mm.events import calendar as evcal
-from mm.sim import daily, portfolio
+from mm.sim import daily, goals, portfolio
+from mm.sim import regime as rg
 
 log = logging.getLogger(__name__)
 FC_PATH = FORECAST_DIR / "forecasts.parquet"
 PF_PATH = FORECAST_DIR / "portfolio.npz"
 STATUS_PATH = META_DIR / "status.json"
+REGIME_PATH = META_DIR / "regime.json"
+GOALS_PATH = FORECAST_DIR / "goals.json"
 MARKET = {"SPX": "US", "NDX": "US", "DJI": "US", "KOSPI": "KR", "KOSDAQ": "KR"}
 MULT_REFRESH = 21   # 백필 시 이벤트 배수 재추정 주기(거래일)
 
@@ -44,15 +47,31 @@ def save_forecasts(df: pd.DataFrame) -> None:
     tmp.replace(FC_PATH)
 
 
-def _row(target: str, px: pd.Series, ev: pd.DataFrame, mults: pd.DataFrame, scale: float) -> dict:
+def _vix() -> pd.Series:
+    return store.load(universe()["regime"]["vix_id"])["value"].dropna()
+
+
+def _regime_inputs(vix: pd.Series, base: pd.Timestamp) -> tuple[pd.Series, int]:
+    th = universe()["regime"]["thresholds"]
+    v = vix[vix.index <= base]
+    cur = int(rg.classify(pd.Series([v.tail(5).mean()]), th).iloc[0])
+    return rg.daily_regime(v, th), cur
+
+
+def _row(target: str, px: pd.Series, ev: pd.DataFrame, mults: pd.DataFrame, scale: float,
+         vix: pd.Series | None = None) -> dict:
     mkt = MARKET.get(target, "US")
     next_day = px.index[-1] + pd.offsets.BDay(1)
     todays = evcal.events_on(ev, next_day, mkt)
     m = evcal.day_multiplier(mults, todays)
-    f = daily.forecast_next(px, event_mult=m, calib_scale=scale, seed=int(px.index[-1].strftime("%Y%m%d")))
+    use = universe()["regime"].get("daily_conditioning", True) and vix is not None and len(vix)
+    dr, cur = _regime_inputs(vix, px.index[-1]) if use else (None, None)
+    f = daily.forecast_next(px, event_mult=m, calib_scale=scale, seed=int(px.index[-1].strftime("%Y%m%d")),
+                            day_regime=dr, current_regime=cur)
     return {"target": target, "base_date": f["base_date"], "target_date": next_day,
             "base_close": f["base_close"], "sigma": f["sigma"], "event_mult": m, "calib_scale": scale,
             "events": ", ".join(todays.name.tolist()), "p_up": f["p_up"],
+            "regime": -1 if f["regime"] is None else int(f["regime"]),
             "q": f["quantiles"], "q_raw": f["quantiles_raw"],
             "made_at": store.now_utc(), "actual_date": pd.NaT, "actual_pct": np.nan}
 
@@ -76,6 +95,7 @@ def _score_inplace(df: pd.DataFrame, pxs: dict[str, pd.Series]) -> pd.DataFrame:
 def backfill(days: int = 500) -> pd.DataFrame:
     """워크포워드 백테스트로 이력 생성 → 첫날부터 보정·신뢰도 패널이 의미를 가짐(look-ahead 없음)."""
     ev = evcal.load()
+    vix = _vix()
     rows = []
     for t in universe()["forecast_targets"]:
         px = store.load(t)["value"].dropna()
@@ -88,7 +108,7 @@ def backfill(days: int = 500) -> pd.DataFrame:
             if mults is None or k % MULT_REFRESH == 0:
                 mults = evcal.estimate_multipliers(r_all, ev, MARKET.get(t, "US"), asof=sub.index[-1] + pd.Timedelta(days=1))
             scale = cal.conformal_scale(hist, asof=sub.index[-1] + pd.Timedelta(days=1))
-            row = _row(t, sub, ev, mults, scale)
+            row = _row(t, sub, ev, mults, scale, vix)
             nxt = px.index[i + 1]
             row["actual_date"] = nxt
             row["actual_pct"] = (px.iloc[i + 1] / row["base_close"] - 1) * 100
@@ -107,6 +127,7 @@ def backfill(days: int = 500) -> pd.DataFrame:
 
 def forecast_today() -> pd.DataFrame:
     ev = evcal.load()
+    vix = _vix()
     fc = load_forecasts()
     pxs = {t: store.load(t)["value"].dropna() for t in universe()["forecast_targets"]}
     if len(fc):
@@ -117,7 +138,7 @@ def forecast_today() -> pd.DataFrame:
             continue
         hist = fc[fc.target == t] if len(fc) else pd.DataFrame(columns=["actual_date", "actual_pct", "q_raw"])
         mults = evcal.estimate_multipliers(daily.log_returns(px), ev, MARKET.get(t, "US"))
-        row = _row(t, px, ev, mults, cal.conformal_scale(hist))
+        row = _row(t, px, ev, mults, cal.conformal_scale(hist), vix)
         row["backfill"] = False
         new.append(row)
     fc = pd.concat([fc, pd.DataFrame(new)], ignore_index=True) if new else fc
@@ -125,19 +146,42 @@ def forecast_today() -> pd.DataFrame:
     return fc
 
 
-def run_portfolio(spec: portfolio.PortfolioSpec | None = None) -> dict:
+def default_spec(**over) -> portfolio.PortfolioSpec:
     cfg = universe()["default_portfolio"]
-    spec = spec or portfolio.PortfolioSpec(weights=cfg["weights"], initial=cfg["initial"],
-                                           monthly_contribution=cfg["monthly_contribution"],
-                                           years=cfg["years"], rebalance=cfg["rebalance"],
-                                           inflation=cfg["inflation"])
-    px = store.load_panel(list(spec.weights)).dropna()
-    res = portfolio.simulate(portfolio.monthly_returns(px), spec)
-    np.savez_compressed(PF_PATH, months=res["months"], invested=res["invested"],
-                        final_real=res["final_real"], mdd=res["mdd"], cagr=res["cagr"],
-                        **{f"real_{p}": v for p, v in res["bands_real"].items()},
-                        **{f"nom_{p}": v for p, v in res["bands_nominal"].items()})
-    return res
+    kw = dict(weights=cfg["weights"], initial=cfg["initial"], monthly_contribution=cfg["monthly_contribution"],
+              years=cfg["years"], rebalance=cfg["rebalance"], inflation=cfg["inflation"],
+              return_haircut=cfg.get("return_haircut", 0.01))
+    kw.update(over)
+    return portfolio.PortfolioSpec(**kw)
+
+
+def fit_regime() -> rg.RegimeModel:
+    rm = rg.fit(_vix(), universe()["regime"]["thresholds"])
+    REGIME_PATH.write_text(json.dumps(rm.to_dict(), ensure_ascii=False, indent=1), encoding="utf-8")
+    return rm
+
+
+def run_portfolio(spec: portfolio.PortfolioSpec | None = None) -> dict:
+    """기본 포트폴리오: 3개 모델 시뮬 → 목표 판정 + 배분 탐색 → goals.json (대시보드·LLM 브리핑 입력)."""
+    U = universe()
+    spec = spec or default_spec()
+    rm = fit_regime()
+    rets = portfolio.monthly_returns(store.load_panel(list(spec.weights)).dropna())
+    res = goals.run_models(rets, spec, rm)
+    verdict = goals.evaluate(res, U["goals"])
+    sweep = goals.allocation_sweep(rets, spec, rm, U["equity_assets"], U["goals"])
+    main = res.get("regime") or res["bootstrap"]
+    np.savez_compressed(PF_PATH, months=main["months"], invested=main["invested"],
+                        final_real=main["final_real"], mdd=main["mdd"], irr=main["irr"],
+                        **{f"real_{p}": v for p, v in main["bands_real"].items()})
+    summary = {k: {"irr_p50": float(np.median(r["irr"])), "irr_p5": float(np.percentile(r["irr"], 5)),
+                   "irr_p95": float(np.percentile(r["irr"], 95)), "p_loss_nominal": r["p_loss_nominal"],
+                   "p_loss_real": r["p_loss_real"], "mdd_p50": float(np.median(r["mdd"])),
+                   "final_real_p50": float(np.median(r["final_real"]))} for k, r in res.items()}
+    GOALS_PATH.write_text(json.dumps({"spec": {**spec.__dict__}, "summary": summary,
+                                      "verdict": verdict.to_dict("records"), "sweep": sweep.to_dict("records")},
+                                     ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    return {"results": res, "verdict": verdict, "sweep": sweep, "regime": rm}
 
 
 def write_status(update_result: pd.DataFrame | None) -> dict:
@@ -151,7 +195,7 @@ def write_status(update_result: pd.DataFrame | None) -> dict:
     return st
 
 
-def run_daily(refresh_events: bool = True) -> dict:
+def run_daily(refresh_events: bool = True, briefing: bool = True, weekly: bool = False) -> dict:
     res = update_all()
     if refresh_events:
         evcal.refresh()
@@ -159,4 +203,12 @@ def run_daily(refresh_events: bool = True) -> dict:
         backfill()
     forecast_today()
     run_portfolio()
-    return write_status(res)
+    st = write_status(res)
+    if briefing:
+        from mm.llm import briefing as br
+        b = br.generate(weekly=False)
+        st["briefing"] = b["_meta"]
+        if weekly:
+            st["briefing_weekly"] = br.generate(weekly=True)["_meta"]
+        STATUS_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    return st

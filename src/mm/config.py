@@ -16,8 +16,11 @@ META_DIR = DATA_DIR / "meta"
 FORECAST_DIR = DATA_DIR / "forecasts"
 CATALOG_DB = META_DIR / "catalog.sqlite"
 
-for _d in (PRICES_DIR, META_DIR, FORECAST_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
+for _d in (PRICES_DIR, META_DIR, FORECAST_DIR, DATA_DIR / "briefings"):
+    try:
+        _d.mkdir(parents=True, exist_ok=True)
+    except OSError:          # 대시보드 컨테이너는 data/ 를 읽기 전용으로 마운트 → worker가 생성
+        pass
 
 
 @dataclass(frozen=True)

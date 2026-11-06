@@ -36,11 +36,27 @@ def ewma_sigma(r: pd.Series, lam: float = LAMBDA) -> pd.Series:
     return s
 
 
+MIN_REGIME_Z = 250        # 국면별 잔차 표본이 이보다 적으면 전체 표본 사용
+
+
 def forecast_next(px: pd.Series, event_mult: float = 1.0, calib_scale: float = 1.0,
-                  n: int = N_SIMS, seed: int | None = None) -> dict:
+                  n: int = N_SIMS, seed: int | None = None,
+                  day_regime: pd.Series | None = None, current_regime: int | None = None) -> dict:
+    """day_regime/current_regime 이 주어지면 '같은 VIX 국면의 날'의 표준화 잔차만 사용."""
     r = log_returns(px)
     sig = ewma_sigma(r)
-    z = (r / sig).iloc[-Z_WINDOW:].replace([np.inf, -np.inf], np.nan).dropna().values
+    zser = (r / sig).replace([np.inf, -np.inf], np.nan).dropna()
+    used_regime = None
+    if day_regime is not None and current_regime is not None:
+        reg = day_regime.reindex(zser.index)
+        zr = zser[reg == current_regime].iloc[-Z_WINDOW * 2:]
+        if len(zr) >= MIN_REGIME_Z:
+            zser, used_regime = zr, current_regime
+        else:
+            zser = zser.iloc[-Z_WINDOW:]
+    else:
+        zser = zser.iloc[-Z_WINDOW:]
+    z = zser.values
     z = (z - z.mean()) / z.std()          # 위치·척도 정규화 (형태만 사용)
     mu = 0.0                              # 일간 드리프트는 노이즈 대비 무시 가능 → 0 (과적합 방지)
     sigma_next = sig.attrs["next"]
@@ -58,4 +74,6 @@ def forecast_next(px: pd.Series, event_mult: float = 1.0, calib_scale: float = 1
         "quantiles": np.quantile(pct, QUANTILES),        # 보정 적용
         "quantiles_raw": np.quantile(raw, QUANTILES),                          # 보정 미적용(컨포멀 학습용)
         "samples": pct,
+        "regime": used_regime,
+        "z_n": len(z),
     }

@@ -2,6 +2,8 @@
 
 - 07:15 KST (화~토) : 미국장 마감(16:00 ET = 05:00/06:00 KST) + Yahoo 일봉 확정 여유
 - 16:10 KST (월~금) : 한국장 마감(15:30 KST) 이후
+- 07:15 슬롯에서 LLM 일일 브리핑 생성, 토요일 07:15(금요일 미국장 마감 후)에는 주간 다이제스트도 생성
+  → 기존 '주간 AI 트렌드 / 주간 증시 트렌드' 예약 작업을 대체
 - 매주 월요일 실행 시 이벤트 캘린더 원격 갱신
 실패해도 프로세스는 유지(다음 슬롯 재시도), 결과는 data/meta/status.json 에 기록.
 """
@@ -34,13 +36,15 @@ def next_run(now: datetime) -> datetime:
 
 def main() -> None:
     if "--now" in sys.argv:
-        pipeline.run_daily()
+        pipeline.run_daily(briefing=True)
     while True:
         nxt = next_run(datetime.now(KST))
         log.info("next run %s", nxt.isoformat())
         time.sleep(max((nxt - datetime.now(KST)).total_seconds(), 1))
         try:
-            st = pipeline.run_daily(refresh_events=nxt.weekday() == 0 or not pipeline.FC_PATH.exists())
+            us_slot = nxt.hour == 7
+            st = pipeline.run_daily(refresh_events=nxt.weekday() == 0 or not pipeline.FC_PATH.exists(),
+                                    briefing=us_slot, weekly=us_slot and nxt.weekday() == 5)
             log.info("done ok=%s err=%s", st["series_ok"], st["series_err"])
         except Exception:  # noqa: BLE001
             log.exception("daily run failed — 다음 슬롯에서 재시도")

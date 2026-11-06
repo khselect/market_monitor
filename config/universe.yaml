@@ -71,3 +71,22 @@ default_portfolio:
   years: 10
   rebalance: quarterly
   inflation: 0.025
+  return_haircut: 0.01      # 과거(2004~) 낙관편향 보정: 모든 자산 연 1%p 차감
+
+# VIX 국면 경계 (월평균 VIX): 안정 < 17 ≤ 보통 < 25 ≤ 위기
+regime:
+  vix_id: VIX
+  thresholds: [17, 25]
+  daily_conditioning: true   # 일간 예측에서 같은 국면의 잔차만 사용 (실데이터 백필 CRPS로 on/off 비교 권장)
+
+# 주식 바스켓으로 간주할 자산 (배분 탐색용)
+equity_assets: [SPY, EWY]
+
+# 목표 판정 — metric: p_loss_nominal | p_loss_real | p_irr_ge | p_cagr_ge | p_mdd_le | p_goal_real
+#   op "<"  : 확률이 threshold 미만이어야 충족 (나쁜 사건)
+#   op ">=" : 확률이 threshold 이상이어야 충족 (좋은 사건)
+goals:
+  - {id: no_loss,   label: "원금 손실 확률 < 5%",           metric: p_loss_nominal, op: "<",  threshold: 0.05}
+  - {id: no_loss_r, label: "실질 원금 손실 확률 < 10%",      metric: p_loss_real,    op: "<",  threshold: 0.10}
+  - {id: irr7,      label: "연평균(IRR) 7% 이상 확률 ≥ 70%", metric: p_irr_ge, param: 0.07, op: ">=", threshold: 0.70}
+  - {id: mdd30,     label: "최대낙폭 −30% 이내 확률 ≥ 80%",  metric: p_mdd_le, param: -0.30, op: ">=", threshold: 0.80}

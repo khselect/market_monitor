@@ -50,3 +50,24 @@ def test_portfolio_no_contribution_zero_return_is_flat():
                                    years=2, inflation=0.0, n_paths=50)
     r = portfolio.simulate(rets, spec)
     assert np.allclose(r["bands_nominal"][50], 100) and r["mdd"].min() == 0
+
+
+def test_alphavantage_parse_and_budget(monkeypatch):
+    from mm.data import sources
+
+    class R:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"Time Series (Daily)": {"2026-11-05": {"4. close": "101.5", "5. volume": "10"},
+                                            "2026-11-04": {"4. close": "100.0", "5. volume": "12"}}}
+
+    monkeypatch.setenv("ALPHAVANTAGE_API_KEY", "k")
+    monkeypatch.setattr(sources.requests, "get", lambda *a, **k: R())
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    av = sources.AlphaVantageSource()
+    av.DAILY_BUDGET = 1
+    out = av.fetch(["SPY", "^GSPC"], pd.Timestamp("2026-01-01"))
+    assert list(out) == ["SPY"] and out["SPY"]["value"].iloc[-1] == 101.5 and out["SPY"].index.is_monotonic_increasing
+    assert av.fetch(["XLK"], pd.Timestamp("2026-01-01")) == {}      # 일일 예산 소진 → 호출 안 함
