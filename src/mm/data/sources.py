@@ -33,7 +33,22 @@ class YahooSource:
     name = "yahoo"
 
     def fetch(self, symbols: list[str], start: pd.Timestamp) -> dict[str, pd.DataFrame]:
+        out = self._fetch_batch(symbols, start)
+        missing = [s for s in symbols if s not in out]
+        if missing:                       # 배치 중 일부 실패(DNS 타임아웃 등)는 예외 없이 빈 열로 옴 → 개별 재시도
+            time.sleep(3)
+            for sym in missing:
+                out.update(self._fetch_batch([sym], start))
+                time.sleep(1)
+        return out
+
+    def _fetch_batch(self, symbols: list[str], start: pd.Timestamp) -> dict[str, pd.DataFrame]:
         import yfinance as yf
+        from mm.config import META_DIR
+        try:                              # 기본 캐시(~/Library/Caches/py-yfinance) 충돌 회피
+            yf.set_tz_cache_location(str(META_DIR / "yf-cache"))
+        except Exception:  # noqa: BLE001
+            pass
 
         def _dl():
             return yf.download(symbols, start=start.strftime("%Y-%m-%d"), auto_adjust=True,

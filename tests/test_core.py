@@ -71,3 +71,13 @@ def test_alphavantage_parse_and_budget(monkeypatch):
     out = av.fetch(["SPY", "^GSPC"], pd.Timestamp("2026-01-01"))
     assert list(out) == ["SPY"] and out["SPY"]["value"].iloc[-1] == 101.5 and out["SPY"].index.is_monotonic_increasing
     assert av.fetch(["XLK"], pd.Timestamp("2026-01-01")) == {}      # 일일 예산 소진 → 호출 안 함
+
+
+def test_missing_forecast_target_is_skipped_not_crash(monkeypatch):
+    """수집 실패로 데이터가 없는 예측 대상(예: ^NDX DNS 타임아웃)은 건너뛰고 나머지는 진행."""
+    from mm import pipeline
+    good = _df(pd.bdate_range("2020-01-01", periods=400), np.linspace(100, 120, 400))
+    empty = _df([], [])
+    monkeypatch.setattr(pipeline.store, "load", lambda sid: good if sid == "SPX" else empty)
+    out = pipeline._target_prices(["SPX", "NDX"])
+    assert list(out) == ["SPX"] and len(out["SPX"]) == 400

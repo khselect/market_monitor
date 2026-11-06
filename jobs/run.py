@@ -16,7 +16,9 @@ p.add_argument("cmd", choices=["daily", "update", "events", "backfill", "forecas
 p.add_argument("--days", type=int, default=500)
 a = p.parse_args()
 if a.cmd == "daily":
-    print(pipeline.run_daily())
+    st = pipeline.run_daily()
+    print(f"완료: 시리즈 ok={st['series_ok']} err={st['series_err']} · 단계오류={len(st['stage_errors'])} · "
+          f"건너뜀={st['skipped_targets']} → 상세: python -m jobs.run health")
 elif a.cmd == "update":
     print(update_all().to_string())
 elif a.cmd == "events":
@@ -56,6 +58,10 @@ elif a.cmd == "health":
     print(f"시리즈 {len(cat)}개 · 오류 {len(err)} · 최근 갱신 {st.get('run_at')} · 오프라인={st.get('offline')}")
     print(f"예측 이력 {len(fc)}건 · 대기 {len(pending)}건")
     print(f"브리핑: {b and b['_meta'].get('generator')} · {b and b['_meta'].get('asof')} · 오류={b and b['_meta'].get('error')}")
+    for e in st.get("stage_errors", []):
+        problems.append(f"단계 실패 {e['stage']}: {e['error']}")
+    for t in st.get("skipped_targets", []):
+        problems.append(f"예측 대상 건너뜀 {t}: 데이터 없음/부족 → 다음 실행에서 수집되면 자동 백필")
     if b and b["_meta"].get("error"):
         problems.append("LLM 브리핑 실패 → 템플릿 사용 중: " + b["_meta"]["error"])
     print("\n".join(["⚠ " + p_ for p_ in problems]) or "✓ 이상 없음")

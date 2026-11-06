@@ -92,17 +92,33 @@ def _score_inplace(df: pd.DataFrame, pxs: dict[str, pd.Series]) -> pd.DataFrame:
     return df
 
 
-def backfill(days: int = 500) -> pd.DataFrame:
-    """워크포워드 백테스트로 이력 생성 → 첫날부터 보정·신뢰도 패널이 의미를 가짐(look-ahead 없음)."""
+MIN_HISTORY = 300   # 예측에 필요한 최소 관측치(EWMA 초기화 + 표준화 잔차 표본)
+
+
+def _target_prices(targets=None) -> dict[str, pd.Series]:
+    """예측 대상 중 데이터가 충분한 것만 반환. 부족/누락은 경고만 남기고 건너뜀(한 대상 장애 격리)."""
+    out = {}
+    for t in targets or universe()["forecast_targets"]:
+        px = store.load(t)["value"].dropna()
+        if len(px) < MIN_HISTORY:
+            log.warning("forecast target %s skipped: %d rows (< %d) — 수집 실패 또는 이력 부족", t, len(px), MIN_HISTORY)
+            continue
+        out[t] = px
+    return out
+
+
+def backfill(days: int = 500, targets: list[str] | None = None) -> pd.DataFrame:
+    """워크포워드 백테스트로 이력 생성 → 첫날부터 보정·신뢰도 패널이 의미를 가짐(look-ahead 없음).
+    targets 를 주면 해당 대상만 다시 만들고 나머지 대상의 기존 이력은 보존."""
     ev = evcal.load()
     vix = _vix()
     rows = []
-    for t in universe()["forecast_targets"]:
-        px = store.load(t)["value"].dropna()
+    pxs = _target_prices(targets)
+    for t, px in pxs.items():
         hist = pd.DataFrame(columns=["actual_date", "actual_pct", "q_raw"])
         r_all = daily.log_returns(px)
         mults = None
-        start = len(px) - days - 1
+        start = max(len(px) - days - 1, MIN_HISTORY - 1)   # 이력이 짧으면 앞부분은 학습용으로만 사용
         for k, i in enumerate(range(start, len(px) - 1)):
             sub = px.iloc[: i + 1]
             if mults is None or k % MULT_REFRESH == 0:
@@ -117,19 +133,30 @@ def backfill(days: int = 500) -> pd.DataFrame:
             hist = pd.concat([hist, pd.DataFrame([{k2: row[k2] for k2 in ("actual_date", "actual_pct", "q_raw")}])],
                              ignore_index=True)
     df = pd.DataFrame(rows)
-    df["backfill"] = True
+    if len(df):
+        df["backfill"] = True
     old = load_forecasts()
     if len(old):
-        df = pd.concat([df, old[~old.get("backfill", False).astype(bool)]], ignore_index=True)
-    save_forecasts(df)
+        is_bf = old["backfill"].fillna(False).astype(bool) if "backfill" in old else pd.Series(False, index=old.index)
+        keep = old[~is_bf | ~old.target.isin(list(pxs))]     # 다시 만든 대상의 백필만 교체
+        df = pd.concat([df, keep], ignore_index=True) if len(df) else keep
+    if len(df):
+        save_forecasts(df)
     return df
+
+
+def missing_backfill_targets() -> list[str]:
+    """예측 이력이 없는 대상(최초 실행 시 수집 실패했다가 복구된 대상 등)."""
+    fc = load_forecasts()
+    have = set(fc.target.unique()) if len(fc) else set()
+    return [t for t in universe()["forecast_targets"] if t not in have]
 
 
 def forecast_today() -> pd.DataFrame:
     ev = evcal.load()
     vix = _vix()
     fc = load_forecasts()
-    pxs = {t: store.load(t)["value"].dropna() for t in universe()["forecast_targets"]}
+    pxs = _target_prices()
     if len(fc):
         fc = _score_inplace(fc, pxs)
     new = []
@@ -195,20 +222,37 @@ def write_status(update_result: pd.DataFrame | None) -> dict:
     return st
 
 
+def _stage(errors: list, name: str, fn, *a, **kw):
+    """단계별 장애 격리: 한 단계가 실패해도 다음 단계와 상태 기록은 계속 진행."""
+    try:
+        return fn(*a, **kw)
+    except Exception as e:  # noqa: BLE001
+        log.exception("stage %s failed", name)
+        errors.append({"stage": name, "error": repr(e)[:300]})
+        return None
+
+
 def run_daily(refresh_events: bool = True, briefing: bool = True, weekly: bool = False) -> dict:
-    res = update_all()
+    errors: list[dict] = []
+    res = _stage(errors, "update", update_all)
     if refresh_events:
-        evcal.refresh()
-    if not FC_PATH.exists():
-        backfill()
-    forecast_today()
-    run_portfolio()
+        _stage(errors, "events", evcal.refresh)
+    missing = missing_backfill_targets()
+    if missing:
+        _stage(errors, "backfill", backfill, targets=missing)
+    _stage(errors, "forecast", forecast_today)
+    _stage(errors, "portfolio", run_portfolio)
     st = write_status(res)
     if briefing:
         from mm.llm import briefing as br
-        b = br.generate(weekly=False)
-        st["briefing"] = b["_meta"]
+        b = _stage(errors, "briefing", br.generate, weekly=False)
+        if b:
+            st["briefing"] = b["_meta"]
         if weekly:
-            st["briefing_weekly"] = br.generate(weekly=True)["_meta"]
-        STATUS_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+            bw = _stage(errors, "briefing_weekly", br.generate, weekly=True)
+            if bw:
+                st["briefing_weekly"] = bw["_meta"]
+    st["stage_errors"] = errors
+    st["skipped_targets"] = [t for t in universe()["forecast_targets"] if t not in _target_prices()]
+    STATUS_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     return st
